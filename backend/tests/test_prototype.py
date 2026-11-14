@@ -1,5 +1,6 @@
 import base64
 import json
+from uuid import uuid4
 from fastapi.testclient import TestClient
 from app.main import app, vault
 
@@ -29,11 +30,28 @@ def test_order_checkout_and_idempotent_webhook():
     with Session(engine) as db:
         session_id = db.get(Order, order["id"]).stripe_session_id
     event["data"]["object"]["id"] = session_id
-    assert client.post("/webhooks/stripe", json=event).json() == {"received": True}
-    assert client.post("/webhooks/stripe", json=event).json() == {"received": True}
+    event["id"] = f"evt_test_{uuid4().hex}"
+    assert client.post("/webhooks/stripe", json=event).json() == {"received": True, "duplicate": False}
+    assert client.post("/webhooks/stripe", json=event).json() == {"received": True, "duplicate": True}
 
 
 def test_credential_destruction():
     order = client.post("/orders", json={"simulated_credential": "synthetic-token"}).json()
     response = client.delete(f"/orders/{order['id']}/credential")
     assert response.json()["credential_destroyed"] is True
+
+
+def test_cancel_and_order_isolation():
+    first = client.post("/orders", json={"simulated_credential": "one"}).json()
+    second = client.post("/orders", json={"simulated_credential": "two"}).json()
+    assert client.post(f"/orders/{first['id']}/cancel").json()["status"] == "cancelled"
+    assert client.get(f"/orders/{second['id']}").json()["status"] == "created"
+
+
+def test_invalid_webhook_session():
+    response = client.post(
+        "/webhooks/stripe",
+        json={"id": "evt_unknown", "type": "checkout.session.completed",
+              "data": {"object": {"id": "cs_unknown"}}},
+    )
+    assert response.status_code == 404

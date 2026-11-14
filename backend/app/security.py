@@ -2,20 +2,20 @@ import base64
 import json
 import os
 import time
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet
 
 
 class CredentialVault:
     """Encrypts simulated credentials; plaintext is never returned by API routes."""
 
     def __init__(self, key: bytes | None = None):
-        self._fernet = Fernet(key or Fernet.generate_key())
+        self._fernet = Fernet(key or os.getenv("CREDENTIAL_VAULT_KEY", Fernet.generate_key()))
 
     def seal(self, value: str) -> bytes:
         return self._fernet.encrypt(value.encode())
 
     def destroy(self, sealed: bytes) -> None:
-        sealed = b"\x00" * len(sealed)
+        del sealed
 
     def inspect_jwt_metadata(self, token: str, now: int | None = None) -> dict:
         parts = token.split(".")
