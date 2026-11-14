@@ -1,51 +1,18 @@
 import hashlib
 import hmac
 import json
-import os
 import time
 from dataclasses import replace
 from datetime import timedelta
 from uuid import uuid4
 
 import pytest
-from app.config import Settings
 from app.lifecycle import expire_due
 from app.main import create_app
 from app.models import AuditEvent, Order, utcnow
-from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select, update
-from sqlalchemy.engine import make_url
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
-from sqlalchemy.schema import CreateSchema, DropSchema
-
-
-@pytest.fixture
-def settings(tmp_path):
-    postgres = os.getenv("TEST_POSTGRES_URL")
-    admin = None
-    schema = "test_" + uuid4().hex
-    url = "sqlite:///" + str(tmp_path / "test.db")
-    if postgres:
-        admin = create_engine(postgres)
-        with admin.begin() as connection:
-            connection.execute(CreateSchema(schema))
-        url = (
-            make_url(postgres)
-            .update_query_dict({"options": "-csearch_path=" + schema})
-            .render_as_string(hide_password=False)
-        )
-    try:
-        yield Settings(
-            database_url=url,
-            vault_key=Fernet.generate_key().decode(),
-            webhook_secret="whsec_unit_test",
-        )
-    finally:
-        if admin:
-            with admin.begin() as connection:
-                connection.execute(DropSchema(schema, cascade=True))
-            admin.dispose()
 
 
 @pytest.fixture
@@ -116,7 +83,7 @@ def status(client, value):
 def test_complete_offline_order_and_cleanup(client):
     value = order(client)
     assert value["amount_cents"] == 2000
-    assert value["fulfillment_status"] == "not_implemented"
+    assert value["fulfillment_status"] == "manual_tracking_available"
     result = checkout(client, value)
     assert result["checkout_url"] is None
     assert (

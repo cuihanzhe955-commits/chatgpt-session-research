@@ -69,3 +69,29 @@ class AuditEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+
+class Fulfillment(Base):
+    """Manual single-purchase workflow, separate from customer payment status."""
+
+    __tablename__ = "manual_fulfillments"
+    order_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    consent_version: Mapped[str] = mapped_column(String(40))
+    consent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    authorized_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    step: Mapped[int] = mapped_column(Integer, default=0)
+    credential_ciphertext: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
+    credential_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    credential_deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )

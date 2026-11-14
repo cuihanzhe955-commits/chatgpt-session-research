@@ -15,6 +15,7 @@ class Settings:
     site_url: str = "http://localhost:5173"
     cors_origins: tuple[str, ...] = ("http://localhost:5173",)
     root_path: str = ""
+    operator_token: str = ""
 
     @classmethod
     def from_env(cls):
@@ -31,9 +32,12 @@ class Settings:
                 if x.strip()
             ),
             root_path=os.getenv("ROOT_PATH", "").rstrip("/"),
+            operator_token=os.getenv("OPERATOR_TOKEN", ""),
         )
 
     def validate(self):
+        if self.operator_token and len(self.operator_token) < 32:
+            raise ValueError("OPERATOR_TOKEN must contain at least 32 characters")
         if not self.vault_key:
             raise ValueError(
                 "CREDENTIAL_VAULT_KEY is required; generate a persistent Fernet key"

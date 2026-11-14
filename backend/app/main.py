@@ -91,7 +91,7 @@ def view(order, mode):
         "created_at": order.created_at.replace(tzinfo=UTC),
         "payment_mode": mode,
         "checkout_url": order.checkout_url,
-        "fulfillment_status": "not_implemented",
+        "fulfillment_status": "manual_tracking_available",
     }
 
 
@@ -446,6 +446,9 @@ def create_app(settings: Settings | None = None):
         db.commit()
         return {"id": order.id, "status": "cancelled"}
 
+    from .fulfillment import install
+
+    install(application, settings, DatabaseSession, Credentials, owned)
     return application
 
 

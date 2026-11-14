@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
+import { CustomerFulfillment, OperatorConsole } from "./Fulfillment";
 
 type Product = { id: string; name: string; amount_cents: number; currency: string };
 type Saved = { id: string; token: string };
@@ -84,10 +85,10 @@ function App() {
     <header><a className="brand" href="./"><span className="brand-icon">S</span> Session Research <span className="version">/ 0.2</span></a>
       <a href={REPO} target="_blank" rel="noreferrer">源代码 ↗</a></header>
     <section className="intro"><div className="eyebrow">ORDER & CHECKOUT LAB</div><h1>把订单流程，<br />先验证清楚。</h1>
-      <p>创建测试订单、体验支付跳转、查询状态与凭证清理。为以后接入网站准备的独立测试模块。</p>
+      <p>验证收款、用户授权与人工单次代付。追踪取消续费、移除付款方式、退出账号与临时凭据清理。</p>
       <div className="mode"><span className="dot" /> {mode === "offline" ? "离线模拟模式 · 不产生扣款" : mode === "stripe_test" ? "Stripe 测试模式 · 不产生真实扣款" : "正在连接服务…"}</div>
     </section>
-    <aside className="boundary">仅接受 <code>synthetic-</code> 开头的合成测试值。请勿粘贴 ChatGPT Session、Cookie 或账号令牌。测试支付成功不代表任何会员已开通。</aside>
+    <aside className="boundary">订单创建框仅接受 <code>synthetic-</code> 开头的测试值；登录信息在下方单独授权后临时提交。请勿粘贴 Session、Cookie 或账号令牌。测试收款成功不代表会员已开通。</aside>
     {error && <div className="message error" role="alert">{error}</div>}
     {notice && <div className="message" role="status">{notice}</div>}
     <div className="grid"><section className="card"><div className="section-label">01 / CREATE</div><h2>创建一笔测试订单</h2>
@@ -119,7 +120,7 @@ function App() {
         <dl><dt>商品</dt><dd>{order.product_name}</dd><dt>订单金额</dt><dd>{money(order.amount_cents, order.currency)}</dd>
           <dt>订单号</dt><dd className="mono">{order.id}</dd><dt>合成凭证</dt><dd>{order.credential_stored ? "已加密保存" : "已清理"}</dd>
           <dt>有效期（本地时间）</dt><dd>{new Date(order.expires_at.endsWith("Z") || /[+-]\d\d:\d\d$/.test(order.expires_at) ? order.expires_at : order.expires_at + "Z").toLocaleString()}</dd>
-          <dt>交付</dt><dd>尚未接入真实交付</dd></dl>
+          <dt>交付</dt><dd>下方查看人工代付流程</dd></dl>
         <details><summary>保存订单查询密钥</summary><p className="hint">仅当前标签页暂存；关闭标签页后请用自己保存的订单号和密钥查询。</p><code className="token">{saved.token}</code>
           <button className="secondary small" onClick={() => void act(async () => { await navigator.clipboard.writeText(JSON.stringify({ order_id: saved.id, access_token: saved.token })); setNotice("订单号与查询密钥已复制。"); })}>复制查询信息</button></details>
         <div className="actions">
@@ -143,7 +144,9 @@ function App() {
         </div><p className="hint">支付页面返回不会改变订单状态。进入 Checkout 后，返回或关闭页面也不代表取消支付；状态由 Webhook 或离线模拟确认。</p>
       </>}
     </section></div>
-    <footer><span>独立模块 · 测试支付 · 不处理真实账号凭证</span><a href={REPO} target="_blank" rel="noreferrer">引用项目：chatgpt-session-research ↗</a></footer>
+    {saved && order && <CustomerFulfillment key={saved.id} id={saved.id} token={saved.token} paid={order.status === "paid"} />}
+    <OperatorConsole />
+    <footer><span>测试收款 · 人工单次代付流程</span><a href={REPO} target="_blank" rel="noreferrer">引用项目：chatgpt-session-research ↗</a></footer>
   </main>;
 }
 

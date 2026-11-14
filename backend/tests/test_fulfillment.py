@@ -1,0 +1,253 @@
+from dataclasses import replace
+from datetime import timedelta
+
+import pytest
+from app.fulfillment import CONSENT_VERSION, STEPS
+from app.lifecycle import expire_due
+from app.main import create_app
+from app.models import AuditEvent, Fulfillment, utcnow
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+ADMIN = {"Authorization": "Bearer " + "operator-test-" * 4}
+
+
+@pytest.fixture
+def client(settings):
+    with TestClient(
+        create_app(replace(settings, operator_token="operator-test-" * 4))
+    ) as value:
+        yield value
+
+
+def paid(client):
+    order = client.post(
+        "/orders", json={"simulated_credential": "synthetic-flow"}
+    ).json()
+    oid = order["id"]
+    owner = {"Authorization": "Bearer " + order["access_token"]}
+    assert client.post(f"/orders/{oid}/checkout", headers=owner).status_code == 200
+    assert (
+        client.post(f"/orders/{oid}/simulate-payment", headers=owner).status_code == 200
+    )
+    return oid, owner
+
+
+def authorized(client):
+    oid, owner = paid(client)
+    assert (
+        client.post(
+            f"/orders/{oid}/consent",
+            headers=owner,
+            json={"version": CONSENT_VERSION, "accepted": True},
+        ).status_code
+        == 200
+    )
+    return oid, owner
+
+
+def attest(client, oid, action):
+    return client.post(
+        f"/operator/orders/{oid}/attest",
+        headers=ADMIN,
+        json={"action": action, "confirmed": True, "evidence_ref": "receipt-001"},
+    )
+
+
+def upload(client, oid, owner):
+    return client.post(
+        f"/orders/{oid}/login-credential",
+        headers=owner,
+        json={"account": "test@example.invalid", "password": "unit-secret-only"},
+    )
+
+
+def test_consent_requires_payment_and_explicit_current_version(client):
+    order = client.post(
+        "/orders", json={"simulated_credential": "synthetic-new"}
+    ).json()
+    path = f"/orders/{order['id']}/consent"
+    headers = {"Authorization": "Bearer " + order["access_token"]}
+    assert (
+        client.post(
+            path, headers=headers, json={"version": CONSENT_VERSION, "accepted": True}
+        ).status_code
+        == 409
+    )
+    oid, owner = paid(client)
+    path = f"/orders/{oid}/consent"
+    assert (
+        client.post(
+            path, headers=owner, json={"version": "old", "accepted": True}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            path, headers=owner, json={"version": CONSENT_VERSION, "accepted": False}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            path, headers=owner, json={"version": CONSENT_VERSION, "accepted": True}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            path, headers=owner, json={"version": CONSENT_VERSION, "accepted": True}
+        ).status_code
+        == 409
+    )
+
+
+def test_order_owner_cannot_act_as_operator(client):
+    oid, owner = authorized(client)
+    assert client.get("/operator/orders", headers=owner).status_code == 403
+    assert (
+        client.post(
+            f"/operator/orders/{oid}/attest",
+            headers=owner,
+            json={
+                "action": "login_confirmed",
+                "confirmed": True,
+                "evidence_ref": "ref-1",
+            },
+        ).status_code
+        == 403
+    )
+    assert client.get(f"/orders/{oid}/fulfillment").status_code == 404
+
+
+def test_complete_single_purchase_in_order_and_secret_absent(client):
+    oid, owner = authorized(client)
+    assert upload(client, oid, owner).status_code == 200
+    assert attest(client, oid, "completed").status_code == 409
+    reveal = client.post(f"/operator/orders/{oid}/reveal-credential", headers=ADMIN)
+    assert reveal.json()["password"] == "unit-secret-only"
+    assert (
+        client.post(
+            f"/operator/orders/{oid}/reveal-credential", headers=ADMIN
+        ).status_code
+        == 409
+    )
+    for action in STEPS:
+        result = attest(client, oid, action)
+        assert result.status_code == 200, result.text
+    assert result.json()["status"] == "completed"
+    assert result.json()["credential_stored"] is False
+    assert attest(client, oid, "completed").status_code == 409
+    assert upload(client, oid, owner).status_code == 409
+    audit = client.get(f"/operator/orders/{oid}/audit", headers=ADMIN).text
+    assert "unit-secret-only" not in audit and "example.invalid" not in audit
+    assert "payment_method_removed" in audit and "renewal_cancelled" in audit
+    assert client.get(f"/orders/{oid}/fulfillment", headers=owner).json()[
+        "steps_completed"
+    ] == list(STEPS)
+
+
+def test_unconsumed_credentials_block_completion(client):
+    oid, owner = authorized(client)
+    upload(client, oid, owner)
+    for action in STEPS[:-1]:
+        assert attest(client, oid, action).status_code == 200
+    assert attest(client, oid, "completed").status_code == 409
+    assert (
+        client.delete(f"/orders/{oid}/login-credential", headers=owner).status_code
+        == 200
+    )
+    assert attest(client, oid, "completed").status_code == 200
+
+
+def test_encrypted_at_rest_and_read_once(client):
+    oid, owner = authorized(client)
+    result = upload(client, oid, owner)
+    assert "unit-secret-only" not in result.text
+    with Session(client.app.state.engine) as db:
+        row = db.get(Fulfillment, oid)
+        assert b"unit-secret-only" not in row.credential_ciphertext
+        assert b"example.invalid" not in row.credential_ciphertext
+    client.post(f"/operator/orders/{oid}/reveal-credential", headers=ADMIN)
+    with Session(client.app.state.engine) as db:
+        assert db.get(Fulfillment, oid).credential_ciphertext is None
+
+
+def test_expiry_worker_deletes_credentials(client):
+    oid, owner = authorized(client)
+    upload(client, oid, owner)
+    with Session(client.app.state.engine) as db:
+        db.get(Fulfillment, oid).credential_expires_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+    expire_due(client.app.state.engine)
+    assert (
+        client.post(
+            f"/operator/orders/{oid}/reveal-credential", headers=ADMIN
+        ).status_code
+        == 409
+    )
+    with Session(client.app.state.engine) as db:
+        assert db.get(Fulfillment, oid).credential_ciphertext is None
+        assert db.scalar(
+            select(AuditEvent.id).where(
+                AuditEvent.event_type == "manual.credential_expired"
+            )
+        )
+
+
+@pytest.mark.parametrize("revoke", [True, False])
+def test_revocation_or_authorization_expiry_stops_login_and_payment(client, revoke):
+    oid, owner = authorized(client)
+    upload(client, oid, owner)
+    if revoke:
+        assert (
+            client.post(f"/orders/{oid}/revoke-consent", headers=owner).status_code
+            == 200
+        )
+    else:
+        with Session(client.app.state.engine) as db:
+            db.get(Fulfillment, oid).authorized_until = utcnow() - timedelta(seconds=1)
+            db.commit()
+    assert attest(client, oid, "login_confirmed").status_code == 409
+    assert attest(client, oid, "membership_active").status_code == 409
+    assert attest(client, oid, "completed").status_code == 409
+    assert upload(client, oid, owner).status_code == 409
+    assert (
+        client.post(
+            f"/operator/orders/{oid}/reveal-credential", headers=ADMIN
+        ).status_code
+        == 409
+    )
+    for action in ["renewal_cancelled", "payment_method_removed", "logged_out"]:
+        assert attest(client, oid, action).status_code == 200
+    flow = client.get(f"/orders/{oid}/fulfillment", headers=owner).json()
+    assert flow["credential_stored"] is False
+    assert flow["steps_completed"] == []  # cleanup must not fabricate a purchase
+    assert "cleanup_required" in flow["status"]
+
+
+def test_validation_does_not_echo_secrets(client):
+    oid, owner = authorized(client)
+    result = client.post(
+        f"/orders/{oid}/login-credential",
+        headers=owner,
+        json={"account": "test", "password": "", "token": "do-not-echo"},
+    )
+    assert result.status_code == 422
+    assert "do-not-echo" not in result.text
+
+
+def test_disabled_operator_rejects_consent_and_secret(settings):
+    with TestClient(create_app(settings)) as client:
+        oid, owner = paid(client)
+        assert client.get("/operator/orders", headers=ADMIN).status_code == 503
+        assert (
+            client.post(
+                f"/orders/{oid}/consent",
+                headers=owner,
+                json={"version": CONSENT_VERSION, "accepted": True},
+            ).status_code
+            == 503
+        )
+        assert upload(client, oid, owner).status_code == 503

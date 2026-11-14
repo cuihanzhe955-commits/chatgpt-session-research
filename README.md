@@ -1,6 +1,6 @@
 # ChatGPT Session / Stripe 路线研究
 
-一个可独立运行、可通过反向代理接入网站的**订单与测试支付模块**。FastAPI + React + SQLite/PostgreSQL + Celery，包含商品目录、订单查询密钥、Checkout、验签 Webhook、过期清理和可操作前端。
+一个可独立运行、可通过反向代理接入网站的**订单、测试收款与人工单次代付流程模块**。FastAPI + React + SQLite/PostgreSQL + Celery，包含商品目录、订单查询密钥、Checkout、验签 Webhook、用户授权、临时凭据和操作后台。
 
 项目仓库：[cuihanzhe955-commits/chatgpt-session-research](https://github.com/cuihanzhe955-commits/chatgpt-session-research)。引用本项目可使用仓库链接或根目录 `CITATION.cff`；协议细节引用见 [官方参考资料](docs/REFERENCES.md)。
 
@@ -17,9 +17,13 @@
 | React 下单、查单、测试支付、刷新、取消及清理 | 已实现 |
 | 离线完整流程 | 已验证，零外部支付请求 |
 | Stripe 测试 SDK 调用 | 已实现；单元测试替身验证，需自己的测试账户联调 |
+| 单次代付授权、人工操作台、逐项凭证编号、撤回授权 | 已实现，见 [单次代付流程](docs/SINGLE_PURCHASE.md) |
+| 临时账号密码加密暂存、一次性领取、到期清理 | 已实现；须启用操作员密钥与清理调度，当前收款仍是测试模式 |
 | 真实扣款、真实会员开通、自动交付、退款、站点会员系统 | 未实现 |
 
 本模块不接收真实 ChatGPT Session JSON、Cookie 或 access token，不调用 OpenAI 未公开支付接口。合成值格式仅为 `synthetic-` 加字母、数字、下划线或连字符。`paid` 仅表示测试支付已确认，不表示 OpenAI 订阅已开通。
+
+新人工流程在独立授权后可暂存账号和密码；不复用旧的合成凭证字段。账号内的登录、付款、取消自动续费、移除付款方式和退出登录由操作员执行，本系统记录其确认与凭证编号，不会冒充平台端验证。用户不授权额外消费或后续续费。
 
 ## 快速启动：离线模式
 

@@ -21,6 +21,9 @@ def expire_due(engine) -> int:
     """Compare-and-set prevents a cleanup job from overwriting a concurrent payment."""
     count = 0
     with Session(engine) as db:
+        from .fulfillment import purge_expired
+
+        purge_expired(db)
         ids = db.scalars(
             select(Order.id).where(
                 Order.expires_at <= utcnow(), Order.status.in_(UNPAID)
