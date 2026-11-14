@@ -1,4 +1,4 @@
-# ChatGPT Session / Stripe 路线研究平台
+# ChatGPT Session / Stripe 路线研究
 
 本项目严格将“真实 ChatGPT Session 代付”与可验证的 Stripe 测试支付隔离。后端只接受合成凭证，不收集、传输或重放真实 Session JSON、access token，也不调用 OpenAI 未公开支付接口。
 
