@@ -1,12 +1,13 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import uuid4
-from sqlalchemy import DateTime, Enum, LargeBinary, String, UniqueConstraint
+
+from sqlalchemy import DateTime, Enum, Integer, LargeBinary, String, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Base(DeclarativeBase):
@@ -25,21 +26,46 @@ class OrderStatus(StrEnum):
 
 class Order(Base):
     __tablename__ = "orders"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    status: Mapped[OrderStatus] = mapped_column(Enum(OrderStatus), default=OrderStatus.CREATED)
-    stripe_session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    credential_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    status: Mapped[OrderStatus] = mapped_column(
+        Enum(OrderStatus), default=OrderStatus.CREATED
+    )
+    stripe_session_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, unique=True
+    )
+    checkout_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    checkout_attempt: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    access_token_hash: Mapped[str] = mapped_column(String(64))
+    product_id: Mapped[str] = mapped_column(String(80))
+    product_name: Mapped[str] = mapped_column(String(200))
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    currency: Mapped[str] = mapped_column(String(3), default="usd")
+    credential_ciphertext: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class AuditEvent(Base):
     __tablename__ = "audit_events"
-    __table_args__ = (UniqueConstraint("provider_event_id", name="uq_audit_provider_event"),)
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    __table_args__ = (
+        UniqueConstraint("provider_event_id", name="uq_audit_provider_event"),
+    )
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
     order_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     event_type: Mapped[str] = mapped_column(String(100))
     provider_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     details: Mapped[str] = mapped_column(String(1000), default="{}")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )

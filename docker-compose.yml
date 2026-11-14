@@ -1,32 +1,71 @@
+x-app-env: &app-env
+  DATABASE_URL: postgresql+psycopg://research:${POSTGRES_PASSWORD:?run python scripts/init_env.py}@postgres:5432/research
+  REDIS_URL: redis://redis:6379/0
+  CREDENTIAL_VAULT_KEY: ${CREDENTIAL_VAULT_KEY:?run python scripts/init_env.py}
+  PAYMENT_MODE: ${PAYMENT_MODE:-offline}
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+  SITE_URL: ${SITE_URL:-http://localhost:5173}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+  ROOT_PATH: ${ROOT_PATH:-}
+
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: research
       POSTGRES_USER: research
-      POSTGRES_PASSWORD: research
-    ports: ["5432:5432"]
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run python scripts/init_env.py}
     volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U research -d research]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
   backend:
     build: ./backend
-    environment:
-      DATABASE_URL: postgresql+psycopg://research:research@postgres:5432/research
-      REDIS_URL: redis://redis:6379/0
-      CREDENTIAL_VAULT_KEY: ${CREDENTIAL_VAULT_KEY:?set a Fernet key}
-      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
-      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
-    ports: ["8000:8000"]
-    depends_on: [postgres, redis]
+    environment: *app-env
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
   worker:
     build: ./backend
     command: celery -A app.celery_app.celery worker --loglevel=INFO
-    environment:
-      DATABASE_URL: postgresql+psycopg://research:research@postgres:5432/research
-      REDIS_URL: redis://redis:6379/0
-      CREDENTIAL_VAULT_KEY: ${CREDENTIAL_VAULT_KEY:?set a Fernet key}
-    depends_on: [postgres, redis]
+    environment: *app-env
+    depends_on:
+      backend: {condition: service_healthy}
+    restart: unless-stopped
+  beat:
+    build: ./backend
+    command: celery -A app.celery_app.celery beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+    environment: *app-env
+    depends_on:
+      backend: {condition: service_healthy}
+    restart: unless-stopped
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-/api}
+    ports: ["127.0.0.1:5173:80"]
+    depends_on:
+      backend: {condition: service_healthy}
+    restart: unless-stopped
 volumes:
   postgres_data:

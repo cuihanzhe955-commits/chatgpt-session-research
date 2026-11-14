@@ -1,7 +1,11 @@
 import base64
+import hashlib
 import json
 import os
+import re
+import secrets
 import time
+
 from cryptography.fernet import Fernet
 
 
@@ -9,9 +13,16 @@ class CredentialVault:
     """Encrypts simulated credentials; plaintext is never returned by API routes."""
 
     def __init__(self, key: bytes | None = None):
-        self._fernet = Fernet(key or os.getenv("CREDENTIAL_VAULT_KEY", Fernet.generate_key()))
+        configured = key or os.getenv("CREDENTIAL_VAULT_KEY")
+        if not configured:
+            raise ValueError("A persistent CREDENTIAL_VAULT_KEY is required")
+        self._fernet = Fernet(configured)
 
     def seal(self, value: str) -> bytes:
+        if not re.fullmatch(r"synthetic-[A-Za-z0-9_-]{1,128}", value):
+            raise ValueError(
+                "Use a synthetic- prefixed test value, not real account credentials"
+            )
         return self._fernet.encrypt(value.encode())
 
     def destroy(self, sealed: bytes) -> None:
@@ -34,3 +45,11 @@ class CredentialVault:
             "expires_at": exp,
             "expired": isinstance(exp, int) and exp <= current,
         }
+
+
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def new_order_token() -> str:
+    return secrets.token_urlsafe(32)
