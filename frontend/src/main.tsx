@@ -88,7 +88,7 @@ function App() {
       <p>验证收款、用户授权与人工单次代付。追踪取消续费、移除付款方式、退出账号与临时凭据清理。</p>
       <div className="mode"><span className="dot" /> {mode === "offline" ? "离线模拟模式 · 不产生扣款" : mode === "stripe_test" ? "Stripe 测试模式 · 不产生真实扣款" : "正在连接服务…"}</div>
     </section>
-    <aside className="boundary">订单创建框仅接受 <code>synthetic-</code> 开头的测试值；登录信息在下方单独授权后临时提交。请勿粘贴 Session、Cookie 或账号令牌。测试收款成功不代表会员已开通。</aside>
+    <aside className="boundary">订单创建框仅接受 <code>synthetic-</code> 开头的测试值；Session 在下方单独授权后临时提交，勿填入合成值框。测试收款成功不代表会员已开通。</aside>
     {error && <div className="message error" role="alert">{error}</div>}
     {notice && <div className="message" role="status">{notice}</div>}
     <div className="grid"><section className="card"><div className="section-label">01 / CREATE</div><h2>创建一笔测试订单</h2>

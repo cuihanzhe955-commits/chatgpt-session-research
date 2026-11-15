@@ -7,14 +7,14 @@ from typing import Literal
 
 from cryptography.fernet import Fernet
 from fastapi import HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from sqlalchemy import or_, select, update
 
 from .models import AuditEvent, Fulfillment, Order, OrderStatus, utcnow
 
-CONSENT_VERSION = "single-purchase-v1"
+CONSENT_VERSION = "single-purchase-session-v2"
 CONSENT_TEXT = (
-    "我授权操作员仅为本订单登录我指定的账号，按订单所列套餐完成一次购买；"
+    "我授权操作员仅为本订单使用我提交的 Session 登录我指定的账号，按订单所列套餐完成一次购买；"
     "不授权额外消费或后续续费。操作员须核实会员到账、取消自动续费、"
     "移除付款方式、退出账号并删除本系统中的临时登录凭据。"
     "如无法完成任一步骤，应暂停交付并联系我，不得标记全部完成。"
@@ -32,14 +32,23 @@ STEPS = (
 
 class Consent(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    version: Literal["single-purchase-v1"]
+    version: Literal["single-purchase-session-v2"]
     accepted: Literal[True]
 
 
 class LoginCredential(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    account: SecretStr = Field(min_length=1, max_length=254)
-    password: SecretStr = Field(min_length=1, max_length=512)
+    credential_type: Literal["session"] = "session"
+    session: SecretStr = Field(min_length=1, max_length=32768)
+
+    @field_validator("session")
+    @classmethod
+    def nonblank_session(cls, value: SecretStr) -> SecretStr:
+        # Opaque input: accepting a value does not verify its issuer or validity.
+        cleaned = value.get_secret_value().strip()
+        if not cleaned:
+            raise ValueError("Session must not be blank")
+        return SecretStr(cleaned)
 
 
 class Attestation(BaseModel):
@@ -53,13 +62,15 @@ class Attestation(BaseModel):
         "completed",
     ]
     confirmed: Literal[True]
-    # A reference to an external receipt/evidence store, never screenshot/password content.
+    # A reference to an external receipt/evidence store, never Session content.
     evidence_ref: str = Field(pattern=r"^[A-Za-z0-9_-]{3,100}$")
 
 
 def active(row):
     return (
-        row.revoked_at is None and row.authorized_until.replace(tzinfo=UTC) > utcnow()
+        row.consent_version == CONSENT_VERSION
+        and row.revoked_at is None
+        and row.authorized_until.replace(tzinfo=UTC) > utcnow()
     )
 
 
@@ -88,9 +99,13 @@ def summary(db, order_id):
             "revoked_cleanup_required"
             if row.revoked_at
             else (
-                "in_progress"
-                if active(row)
-                else "authorization_expired_cleanup_required"
+                "legacy_consent_cleanup_required"
+                if row.consent_version != CONSENT_VERSION
+                else (
+                    "in_progress"
+                    if active(row)
+                    else "authorization_expired_cleanup_required"
+                )
             )
         ),
         "consent_version": row.consent_version,
@@ -176,6 +191,7 @@ def install(application, settings, DatabaseSession, Credentials, owned):
             "text": CONSENT_TEXT,
             "authorization_hours": 24,
             "credential_ttl_minutes": 15,
+            "credential_type": "session",
             "execution": "manual",
             "customer_payment": settings.payment_mode,
             "operator_enabled": bool(settings.operator_token),
@@ -256,8 +272,8 @@ def install(application, settings, DatabaseSession, Credentials, owned):
         sealed = Fernet(settings.vault_key.encode()).encrypt(
             json.dumps(
                 {
-                    "account": payload.account.get_secret_value(),
-                    "password": payload.password.get_secret_value(),
+                    "credential_type": "session",
+                    "session": payload.session.get_secret_value(),
                 }
             ).encode()
         )

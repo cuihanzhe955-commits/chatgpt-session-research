@@ -59,7 +59,7 @@ def upload(client, oid, owner):
     return client.post(
         f"/orders/{oid}/login-credential",
         headers=owner,
-        json={"account": "test@example.invalid", "password": "unit-secret-only"},
+        json={"credential_type": "session", "session": "unit-session-secret-only"},
     )
 
 
@@ -126,7 +126,7 @@ def test_complete_single_purchase_in_order_and_secret_absent(client):
     assert upload(client, oid, owner).status_code == 200
     assert attest(client, oid, "completed").status_code == 409
     reveal = client.post(f"/operator/orders/{oid}/reveal-credential", headers=ADMIN)
-    assert reveal.json()["password"] == "unit-secret-only"
+    assert reveal.json()["session"] == "unit-session-secret-only"
     assert (
         client.post(
             f"/operator/orders/{oid}/reveal-credential", headers=ADMIN
@@ -141,7 +141,7 @@ def test_complete_single_purchase_in_order_and_secret_absent(client):
     assert attest(client, oid, "completed").status_code == 409
     assert upload(client, oid, owner).status_code == 409
     audit = client.get(f"/operator/orders/{oid}/audit", headers=ADMIN).text
-    assert "unit-secret-only" not in audit and "example.invalid" not in audit
+    assert "unit-session-secret-only" not in audit and "example.invalid" not in audit
     assert "payment_method_removed" in audit and "renewal_cancelled" in audit
     assert client.get(f"/orders/{oid}/fulfillment", headers=owner).json()[
         "steps_completed"
@@ -164,10 +164,10 @@ def test_unconsumed_credentials_block_completion(client):
 def test_encrypted_at_rest_and_read_once(client):
     oid, owner = authorized(client)
     result = upload(client, oid, owner)
-    assert "unit-secret-only" not in result.text
+    assert "unit-session-secret-only" not in result.text
     with Session(client.app.state.engine) as db:
         row = db.get(Fulfillment, oid)
-        assert b"unit-secret-only" not in row.credential_ciphertext
+        assert b"unit-session-secret-only" not in row.credential_ciphertext
         assert b"example.invalid" not in row.credential_ciphertext
     client.post(f"/operator/orders/{oid}/reveal-credential", headers=ADMIN)
     with Session(client.app.state.engine) as db:
@@ -232,10 +232,74 @@ def test_validation_does_not_echo_secrets(client):
     result = client.post(
         f"/orders/{oid}/login-credential",
         headers=owner,
-        json={"account": "test", "password": "", "token": "do-not-echo"},
+        json={"session": "", "token": "do-not-echo"},
     )
     assert result.status_code == 422
     assert "do-not-echo" not in result.text
+
+
+@pytest.mark.parametrize(
+    "value", ["opaque-session-test", '{"sessionToken":"json-test-value"}']
+)
+def test_session_text_roundtrip_and_single_use(client, value):
+    oid, owner = authorized(client)
+    result = client.post(
+        f"/orders/{oid}/login-credential",
+        headers=owner,
+        json={"credential_type": "session", "session": value},
+    )
+    assert result.status_code == 200
+    assert value not in result.text
+    response = client.post(f"/operator/orders/{oid}/reveal-credential", headers=ADMIN)
+    assert response.json() == {"credential_type": "session", "session": value}
+    assert response.headers["cache-control"] == "no-store"
+    assert (
+        client.post(
+            f"/operator/orders/{oid}/reveal-credential", headers=ADMIN
+        ).status_code
+        == 409
+    )
+    audit = client.get(f"/operator/orders/{oid}/audit", headers=ADMIN).text
+    assert value not in audit
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"session": "   "},
+        {"session": ""},
+        {"session": "x" * 32769},
+        {"account": "old-account", "password": "old-password"},
+        {"credential_type": "password", "session": "do-not-echo"},
+    ],
+)
+def test_invalid_or_legacy_credential_payload_rejected(client, payload):
+    oid, owner = authorized(client)
+    response = client.post(
+        f"/orders/{oid}/login-credential", headers=owner, json=payload
+    )
+    assert response.status_code == 422
+    for secret in ("old-password", "old-account", "do-not-echo", "x" * 100):
+        assert secret not in response.text
+
+
+def test_session_requires_new_consent_version(client):
+    oid, owner = authorized(client)
+    with Session(client.app.state.engine) as db:
+        db.get(Fulfillment, oid).consent_version = "single-purchase-v1"
+        db.commit()
+    assert upload(client, oid, owner).status_code == 409
+    assert attest(client, oid, "login_confirmed").status_code == 409
+    assert (
+        client.post(
+            f"/operator/orders/{oid}/reveal-credential", headers=ADMIN
+        ).status_code
+        == 409
+    )
+    assert (
+        client.get(f"/orders/{oid}/fulfillment", headers=owner).json()["status"]
+        == "legacy_consent_cleanup_required"
+    )
 
 
 def test_disabled_operator_rejects_consent_and_secret(settings):

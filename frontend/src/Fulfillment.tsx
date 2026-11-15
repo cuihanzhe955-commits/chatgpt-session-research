@@ -15,7 +15,8 @@ const steps: Record<string, string> = {
 };
 const states: Record<string, string> = { awaiting_consent: "等待授权", in_progress: "待处理 / 处理中",
   completed: "单次交付已完成", revoked_cleanup_required: "授权已撤回，须处理清理与售后",
-  authorization_expired_cleanup_required: "授权已过期，须处理清理与售后" };
+  authorization_expired_cleanup_required: "授权已过期，须处理清理与售后",
+  legacy_consent_cleanup_required: "旧版授权须清理，新订单请使用 Session 授权" };
 async function call<T>(path: string, token: string, method = "GET", body?: unknown): Promise<T> {
   const response = await fetch(API + path, { method, cache: "no-store", headers: {
     Authorization: `Bearer ${token}`, ...(body ? { "Content-Type": "application/json" } : {}),
@@ -29,13 +30,17 @@ export function CustomerFulfillment({ id, token, paid }: { id: string; token: st
   const [flow, setFlow] = useState<Flow | null>(null);
   const [policy, setPolicy] = useState<Policy | null>(null);
   const [agree, setAgree] = useState(false);
-  const [account, setAccount] = useState("");
-  const [password, setPassword] = useState("");
+  const [sessionValue, setSessionValue] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   useEffect(() => {
+    const hide = () => { if (document.hidden) setSessionValue(""); };
+    document.addEventListener("visibilitychange", hide);
+    return () => document.removeEventListener("visibilitychange", hide);
+  }, []);
+  useEffect(() => {
     let active = true;
-    setFlow(null); setAccount(""); setPassword(""); setAgree(false); setMessage("");
+    setFlow(null); setSessionValue(""); setAgree(false); setMessage("");
     Promise.all([call<Policy>("/fulfillment-policy", token), call<Flow>(`/orders/${id}/fulfillment`, token)])
       .then(([p, f]) => { if (active) { setPolicy(p); setFlow(f); } })
       .catch(e => { if (active) setMessage(e.message); });
@@ -47,7 +52,7 @@ export function CustomerFulfillment({ id, token, paid }: { id: string; token: st
       const result = await call<Flow>(`/orders/${id}/${path}`, token, method, body);
       setFlow(result); setMessage("操作已保存。平台内步骤由操作员人工执行并确认。");
     } catch (e) { setMessage((e as Error).message); }
-    finally { setPassword(""); setAccount(""); setBusy(false); }
+    finally { setSessionValue(""); setBusy(false); }
   }
   return <section className="card" aria-label="单次代付授权">
     <div className="section-label">03 / SINGLE PURCHASE</div><h2>单次代付授权与交付</h2>
@@ -66,11 +71,10 @@ export function CustomerFulfillment({ id, token, paid }: { id: string; token: st
       <p className="hint">以上为操作员确认记录。系统未连接第三方账号状态核验接口。</p>
       <p>系统临时凭据：{flow.credential_stored ? "加密暂存，等待领取或自动过期" : "当前未保存"}</p>
       {flow.status === "in_progress" && !flow.steps_completed.includes("membership_active") && <form onSubmit={e => {
-        e.preventDefault(); void act("login-credential", { account, password });
+        e.preventDefault(); void act("login-credential", { credential_type: "session", session: sessionValue });
       }}>
-        <p>可配合操作员现场登录，或临时提交本次登录信息。暂存最长 15 分钟，操作员领取后立即从在线数据库删除。</p>
-        <label>登录账号<input required maxLength={254} value={account} autoComplete="off" onChange={e => setAccount(e.target.value)} /></label>
-        <label>临时登录密码<input type="password" required maxLength={512} autoComplete="new-password" value={password} onChange={e => setPassword(e.target.value)} /></label>
+        <p>提交本次授权的 Session 文本（令牌或 Session JSON）。加密暂存最长 15 分钟，操作员领取后立即从在线数据库删除。提交成功不代表 Session 已验证或账号已登录。</p>
+        <label>本次登录 Session<input type="password" required maxLength={32768} autoComplete="off" spellCheck={false} value={sessionValue} onChange={e => setSessionValue(e.target.value)} /></label>
         <button disabled={busy}>加密提交本次登录信息</button>
       </form>}
       <div className="actions">
@@ -87,7 +91,7 @@ export function OperatorConsole() {
   const [token, setToken] = useState("");
   const [orders, setOrders] = useState<Flow[]>([]);
   const [selected, setSelected] = useState("");
-  const [secret, setSecret] = useState<{ account: string; password: string } | null>(null);
+  const [secret, setSecret] = useState<{ credential_type: "session"; session: string } | null>(null);
   const [evidence, setEvidence] = useState("");
   const [cleanupAction, setCleanupAction] = useState("renewal_cancelled");
   const [confirmed, setConfirmed] = useState(false);
@@ -125,7 +129,7 @@ export function OperatorConsole() {
           setSecret(await call(`/operator/orders/${selected}/reveal-credential`, token, "POST")); await load();
         })}>一次性领取登录凭据并从数据库删除</button>}
         {secret && <div><p>本次领取的信息将在 60 秒后、切换标签页或确认步骤时清除显示。</p>
-          <label>账号<input readOnly value={secret.account} /></label><label>密码<input type="password" readOnly value={secret.password} /></label>
+          <label>本次 Session<input type="password" readOnly value={secret.session} autoComplete="off" /></label>
           <button className="secondary" onClick={() => setSecret(null)}>立即清除显示</button></div>}
         {current.status !== "completed" && <form onSubmit={e => { e.preventDefault(); setSecret(null); void run(async () => {
           await call(`/operator/orders/${selected}/attest`, token, "POST", {
@@ -135,7 +139,7 @@ export function OperatorConsole() {
           {cleanupOnly ? <label>授权已停止，仅允许记录清理操作<select value={cleanupAction} onChange={e => setCleanupAction(e.target.value)}>
             {["renewal_cancelled", "payment_method_removed", "logged_out"].map(key => <option key={key} value={key}>{steps[key]}</option>)}
           </select></label> : <p>下一步：{steps[current.next_step || ""]}</p>}
-          <label>凭证编号（不填密码或卡号）<input value={evidence} required pattern="[A-Za-z0-9_-]{3,100}" maxLength={100} onChange={e => setEvidence(e.target.value)} /></label>
+          <label>凭证编号（不填 Session 或卡号）<input value={evidence} required pattern="[A-Za-z0-9_-]{3,100}" maxLength={100} onChange={e => setEvidence(e.target.value)} /></label>
           <label><input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} /> 我已实际完成并核实这一步</label>
           <button disabled={busy || !confirmed}>记录确认</button>
         </form>}
