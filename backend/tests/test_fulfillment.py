@@ -1,7 +1,10 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, timedelta
+from threading import Barrier
 
 import pytest
+from app import fulfillment
 from app.fulfillment import CONSENT_VERSION, STEPS
 from app.lifecycle import expire_due
 from app.main import create_app
@@ -61,6 +64,16 @@ def upload(client, oid, owner):
         headers=owner,
         json={"credential_type": "session", "session": "unit-session-secret-only"},
     )
+
+
+def pause(client, oid, reason="other", headers=ADMIN):
+    return client.post(
+        f"/operator/orders/{oid}/pause", headers=headers, json={"reason": reason}
+    )
+
+
+def resume(client, oid, headers=ADMIN):
+    return client.post(f"/operator/orders/{oid}/resume", headers=headers)
 
 
 def test_consent_requires_payment_and_explicit_current_version(client):
@@ -315,3 +328,132 @@ def test_disabled_operator_rejects_consent_and_secret(settings):
             == 503
         )
         assert upload(client, oid, owner).status_code == 503
+
+
+def test_pause_requires_operator_and_valid_reason(client):
+    oid, owner = authorized(client)
+    assert pause(client, oid, headers=owner).status_code == 403
+    assert pause(client, oid, reason="not-a-reason").status_code == 422
+    result = pause(client, oid, reason="verification_required")
+    assert result.status_code == 200
+    assert result.json()["status"] == "paused"
+    assert result.json()["pause_reason"] == "verification_required"
+    assert pause(client, oid).status_code == 409
+
+
+def test_pause_deletes_credentials_and_blocks_work_until_resume(client):
+    oid, owner = authorized(client)
+    before = client.get(f"/orders/{oid}/fulfillment", headers=owner).json()
+    assert upload(client, oid, owner).status_code == 200
+    result = pause(client, oid, reason="payment_failed")
+    assert result.status_code == 200
+    paused = result.json()
+    assert paused["credential_stored"] is False
+    assert paused["credential_deleted_at"] is not None
+    assert upload(client, oid, owner).status_code == 409
+    assert (
+        client.post(
+            f"/operator/orders/{oid}/reveal-credential", headers=ADMIN
+        ).status_code
+        == 409
+    )
+    for action in ["login_confirmed", "membership_active", "renewal_cancelled", "completed"]:
+        assert attest(client, oid, action).status_code == 409
+
+    result = resume(client, oid)
+    assert result.status_code == 200
+    resumed = result.json()
+    assert resumed["status"] == "in_progress"
+    assert resumed["pause_reason"] is None
+    assert resumed["authorized_until"] == before["authorized_until"]
+    assert resumed["credential_stored"] is False
+    assert resumed["credential_deleted_at"] == paused["credential_deleted_at"]
+    assert resume(client, oid).status_code == 409
+    assert (
+        client.post(
+            f"/operator/orders/{oid}/reveal-credential", headers=ADMIN
+        ).status_code
+        == 409
+    )
+    assert upload(client, oid, owner).status_code == 200
+
+
+def test_paused_cleanup_advances_only_at_cleanup_stage(client):
+    oid, _ = authorized(client)
+    for action in STEPS[:2]:
+        assert attest(client, oid, action).status_code == 200
+    assert pause(client, oid, reason="renewal_cleanup_failed").status_code == 200
+    for action in STEPS[2:5]:
+        result = attest(client, oid, action)
+        assert result.status_code == 200, result.text
+        assert result.json()["status"] == "paused"
+    assert result.json()["next_step"] == "completed"
+    assert attest(client, oid, "completed").status_code == 409
+    assert resume(client, oid).status_code == 200
+    result = attest(client, oid, "completed")
+    assert result.status_code == 200
+    assert result.json()["status"] == "completed"
+    assert result.json()["pause_reason"] is None
+    assert pause(client, oid).status_code == 409
+    assert resume(client, oid).status_code == 409
+
+
+@pytest.mark.parametrize("revoke", [True, False])
+def test_paused_workflow_cannot_resume_after_revoke_or_expiry(client, revoke):
+    oid, owner = authorized(client)
+    assert pause(client, oid).status_code == 200
+    if revoke:
+        assert (
+            client.post(f"/orders/{oid}/revoke-consent", headers=owner).status_code
+            == 200
+        )
+        expected = "revoked_cleanup_required"
+    else:
+        with Session(client.app.state.engine) as db:
+            db.get(Fulfillment, oid).authorized_until = utcnow() - timedelta(seconds=1)
+            db.commit()
+        expected = "authorization_expired_cleanup_required"
+    flow = client.get(f"/orders/{oid}/fulfillment", headers=owner).json()
+    assert flow["status"] == expected
+    assert flow["pause_reason"] is None
+    assert resume(client, oid).status_code == 409
+    assert pause(client, oid).status_code == 409
+
+
+def test_pause_resume_order_is_deterministic_with_frozen_clock(client, monkeypatch):
+    oid, _ = authorized(client)
+    fixed = utcnow()
+    monkeypatch.setattr(fulfillment, "utcnow", lambda: fixed)
+    assert pause(client, oid).status_code == 200
+    assert resume(client, oid).status_code == 200
+    with Session(client.app.state.engine) as db:
+        events = db.scalars(
+            select(AuditEvent)
+            .where(
+                AuditEvent.order_id == oid,
+                AuditEvent.event_type.in_(["manual.paused", "manual.resumed"]),
+            )
+            .order_by(AuditEvent.created_at)
+        ).all()
+    assert [event.event_type for event in events] == ["manual.paused", "manual.resumed"]
+    assert events[0].created_at.replace(tzinfo=UTC) == fixed
+    assert events[1].created_at.replace(tzinfo=UTC) == fixed + timedelta(microseconds=1)
+
+
+def test_simultaneous_pause_requests_allow_only_one_transition(client):
+    oid, owner = authorized(client)
+    assert upload(client, oid, owner).status_code == 200
+    barrier = Barrier(2)
+
+    def request_pause():
+        barrier.wait()
+        return pause(client, oid)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: request_pause(), range(2)))
+    assert sorted(result.status_code for result in results) == [200, 409]
+    flow = client.get(f"/orders/{oid}/fulfillment", headers=owner).json()
+    assert flow["status"] == "paused"
+    assert flow["credential_stored"] is False
+    events = client.get(f"/operator/orders/{oid}/audit", headers=ADMIN).json()["events"]
+    assert sum(event["event"] == "manual.paused" for event in events) == 1

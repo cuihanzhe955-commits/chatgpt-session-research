@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 type Flow = { status: string; steps_completed: string[]; credential_stored: boolean;
   next_step?: string; authorized_until?: string; order_id?: string;
-  product_name?: string; amount_cents?: number; currency?: string };
+  product_name?: string; amount_cents?: number; currency?: string; pause_reason?: string };
 type Policy = { version: string; text: string; operator_enabled: boolean };
 const API = (import.meta.env.VITE_API_BASE || "/api").replace(/\/$/, "");
 const steps: Record<string, string> = {
@@ -14,9 +14,15 @@ const steps: Record<string, string> = {
   completed: "已清理临时凭据并完成本次交付",
 };
 const states: Record<string, string> = { awaiting_consent: "等待授权", in_progress: "待处理 / 处理中",
+  paused: "交付已暂停，等待处理",
   completed: "单次交付已完成", revoked_cleanup_required: "授权已撤回，须处理清理与售后",
   authorization_expired_cleanup_required: "授权已过期，须处理清理与售后",
   legacy_consent_cleanup_required: "旧版授权须清理，新订单请使用 Session 授权" };
+const pauseReasons: Record<string, string> = {
+  checkout_rejected: "创建结算被拒绝", payment_failed: "付款未完成",
+  verification_required: "需要进一步验证", renewal_cleanup_failed: "取消续费待处理",
+  payment_method_cleanup_failed: "移除付款方式待处理", other: "其他问题待处理",
+};
 async function call<T>(path: string, token: string, method = "GET", body?: unknown): Promise<T> {
   const response = await fetch(API + path, { method, cache: "no-store", headers: {
     Authorization: `Bearer ${token}`, ...(body ? { "Content-Type": "application/json" } : {}),
@@ -58,6 +64,7 @@ export function CustomerFulfillment({ id, token, paid }: { id: string; token: st
     <div className="section-label">03 / SINGLE PURCHASE</div><h2>单次代付授权与交付</h2>
     <p className="hint">当前收款仍为测试模式。本页用于验证人工代付流程，不会自动登录或执行账号内支付。</p>
     <p>{states[flow?.status || ""] || "加载中…"}</p>
+    {flow?.pause_reason && <p role="status">暂停原因：{pauseReasons[flow.pause_reason]}。暂停不会自动退款或撤销已经发生的购买。</p>}
     {message && <p role="status">{message}</p>}
     {flow?.status === "awaiting_consent" && policy && <>
       <p>{policy.text}</p><p className="hint">本次授权有效 24 小时。授权范围仅为当前订单所列商品及金额。</p>
@@ -80,7 +87,7 @@ export function CustomerFulfillment({ id, token, paid }: { id: string; token: st
       <div className="actions">
         <button className="secondary" disabled={busy} onClick={() => void act("fulfillment", undefined, "GET")}>刷新交付状态</button>
         {flow.credential_stored && <button className="secondary" disabled={busy} onClick={() => void act("login-credential", undefined, "DELETE")}>立即删除临时凭据</button>}
-        {flow.status === "in_progress" && <button className="text-button" disabled={busy} onClick={() => void act("revoke-consent")}>撤回尚未执行的授权并删除凭据</button>}
+        {["in_progress", "paused"].includes(flow.status) && <button className="text-button" disabled={busy} onClick={() => void act("revoke-consent")}>撤回尚未执行的授权并删除凭据</button>}
       </div>
     </>}
   </section>;
@@ -98,6 +105,7 @@ export function OperatorConsole() {
   const [message, setMessage] = useState("");
   const [history, setHistory] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pauseReason, setPauseReason] = useState("checkout_rejected");
   const current = orders.find(o => o.order_id === selected);
   const cleanupOnly = current?.status.includes("cleanup_required");
   useEffect(() => {
@@ -125,13 +133,27 @@ export function OperatorConsole() {
       {current && <>
         <p>本单商品：{current.product_name} · {(current.amount_cents || 0) / 100} {current.currency}（测试订单）</p>
         <ol>{Object.entries(steps).map(([key, text]) => <li key={key}>{current.steps_completed.includes(key) ? "✓ " : "○ "}{text}</li>)}</ol>
+        {current.pause_reason && <p>暂停原因：{pauseReasons[current.pause_reason]}</p>}
+        {current.status === "in_progress" && <div>
+          <label>暂停原因<select value={pauseReason} onChange={e => setPauseReason(e.target.value)}>
+            {Object.entries(pauseReasons).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+          </select></label>
+          <button className="secondary" disabled={busy} onClick={() => { setSecret(null); void run(async () => {
+            await call(`/operator/orders/${selected}/pause`, token, "POST", { reason: pauseReason });
+            setConfirmed(false); setEvidence(""); await load();
+          }); }}>暂停交付并删除暂存凭据</button>
+        </div>}
+        {current.status === "paused" && <button className="secondary" disabled={busy} onClick={() => void run(async () => {
+          await call(`/operator/orders/${selected}/resume`, token, "POST");
+          setConfirmed(false); setEvidence(""); await load();
+        })}>问题已处理，恢复交付（不会自动重试付款）</button>}
         {current.credential_stored && current.status === "in_progress" && <button disabled={busy} onClick={() => void run(async () => {
           setSecret(await call(`/operator/orders/${selected}/reveal-credential`, token, "POST")); await load();
         })}>一次性领取登录凭据并从数据库删除</button>}
         {secret && <div><p>本次领取的信息将在 60 秒后、切换标签页或确认步骤时清除显示。</p>
           <label>本次 Session<input type="password" readOnly value={secret.session} autoComplete="off" /></label>
           <button className="secondary" onClick={() => setSecret(null)}>立即清除显示</button></div>}
-        {current.status !== "completed" && <form onSubmit={e => { e.preventDefault(); setSecret(null); void run(async () => {
+        {current.status !== "completed" && (current.status !== "paused" || ["renewal_cancelled", "payment_method_removed", "logged_out"].includes(current.next_step || "")) && <form onSubmit={e => { e.preventDefault(); setSecret(null); void run(async () => {
           await call(`/operator/orders/${selected}/attest`, token, "POST", {
             action: cleanupOnly ? cleanupAction : current.next_step, confirmed: true, evidence_ref: evidence,
           }); setEvidence(""); setConfirmed(false); await load();

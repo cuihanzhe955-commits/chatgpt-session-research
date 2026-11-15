@@ -66,6 +66,26 @@ class Attestation(BaseModel):
     evidence_ref: str = Field(pattern=r"^[A-Za-z0-9_-]{3,100}$")
 
 
+class PauseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: Literal[
+        "checkout_rejected", "payment_failed", "verification_required",
+        "renewal_cleanup_failed", "payment_method_cleanup_failed", "other",
+    ]
+
+
+def pause_state(db, order_id):
+    event = db.scalar(
+        select(AuditEvent)
+        .where(AuditEvent.order_id == order_id,
+               AuditEvent.event_type.in_(["manual.paused", "manual.resumed"]))
+        .order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc()).limit(1)
+    )
+    if event and event.event_type == "manual.paused":
+        return json.loads(event.details)["reason"]
+    return None
+
+
 def active(row):
     return (
         row.consent_version == CONSENT_VERSION
@@ -74,12 +94,13 @@ def active(row):
     )
 
 
-def record(db, row, event, details=None):
+def record(db, row, event, details=None, created_at=None):
     db.add(
         AuditEvent(
             order_id=row.order_id,
             event_type="manual." + event,
             details=json.dumps(details or {}, separators=(",", ":")),
+            created_at=created_at or utcnow(),
         )
     )
 
@@ -92,8 +113,9 @@ def summary(db, order_id):
             "steps_completed": [],
             "credential_stored": False,
         }
-    return {
-        "status": "completed"
+    reason = pause_state(db, order_id)
+    status = (
+        "completed"
         if row.step == len(STEPS)
         else (
             "revoked_cleanup_required"
@@ -102,12 +124,15 @@ def summary(db, order_id):
                 "legacy_consent_cleanup_required"
                 if row.consent_version != CONSENT_VERSION
                 else (
-                    "in_progress"
+                    ("paused" if reason else "in_progress")
                     if active(row)
                     else "authorization_expired_cleanup_required"
                 )
             )
-        ),
+        )
+    )
+    return {
+        "status": status,
         "consent_version": row.consent_version,
         "authorized_until": row.authorized_until.replace(tzinfo=UTC),
         "steps_completed": list(STEPS[: row.step]),
@@ -115,6 +140,7 @@ def summary(db, order_id):
         "credential_stored": row.credential_ciphertext is not None,
         "credential_deleted_at": row.credential_deleted_at,
         "verification": "operator_attestation_not_provider_verified",
+        "pause_reason": reason if status == "paused" else None,
     }
 
 
@@ -170,18 +196,22 @@ def install(application, settings, DatabaseSession, Credentials, owned):
         return row
 
     def save(db, row, changes, event, details=None):
+        # Keep audit ordering deterministic even when the database clock has coarse precision.
+        changed_at = max(
+            utcnow(), row.updated_at.replace(tzinfo=UTC) + timedelta(microseconds=1)
+        )
         changed = db.execute(
             update(Fulfillment)
             .where(
                 Fulfillment.order_id == row.order_id,
                 Fulfillment.updated_at == row.updated_at,
             )
-            .values(**changes, updated_at=utcnow())
+            .values(**changes, updated_at=changed_at)
         ).rowcount
         if not changed:
             db.rollback()
             raise HTTPException(409, "workflow changed; refresh before retrying")
-        record(db, row, event, details)
+        record(db, row, event, details, changed_at)
         db.commit()
 
     @application.get("/fulfillment-policy")
@@ -267,7 +297,7 @@ def install(application, settings, DatabaseSession, Credentials, owned):
         }:
             raise HTTPException(400, "HTTPS is required for login credentials")
         row = fetch(db, order_id)
-        if not active(row) or row.step >= 2:
+        if not active(row) or row.step >= 2 or pause_state(db, order_id):
             raise HTTPException(409, "login authorization is no longer active")
         sealed = Fernet(settings.vault_key.encode()).encrypt(
             json.dumps(
@@ -347,7 +377,8 @@ def install(application, settings, DatabaseSession, Credentials, owned):
     def reveal(order_id: str, credentials: Credentials, db: DatabaseSession):
         operator(credentials)
         row = fetch(db, order_id)
-        if not active(row) or row.step >= 2 or row.credential_ciphertext is None:
+        if (not active(row) or row.step >= 2 or row.credential_ciphertext is None
+                or pause_state(db, order_id)):
             raise HTTPException(409, "credential unavailable or authorization inactive")
         value = json.loads(
             Fernet(settings.vault_key.encode()).decrypt(row.credential_ciphertext)
@@ -373,6 +404,8 @@ def install(application, settings, DatabaseSession, Credentials, owned):
         index = STEPS.index(payload.action)
         # Cleanup remains available after consent is withdrawn/expires. It never authorizes payment.
         cleanup = index in {2, 3, 4}
+        if pause_state(db, order_id) and not cleanup:
+            raise HTTPException(409, "workflow paused; resolve and resume first")
         if not active(row) and not cleanup:
             raise HTTPException(409, "authorization inactive; cleanup only")
         if row.step >= len(STEPS) or (
@@ -400,6 +433,30 @@ def install(application, settings, DatabaseSession, Credentials, owned):
             "step_attested",
             {"action": payload.action, "evidence_ref": payload.evidence_ref},
         )
+        return summary(db, order_id)
+
+    @application.post("/operator/orders/{order_id}/pause")
+    def pause(order_id: str, payload: PauseRequest, credentials: Credentials,
+              db: DatabaseSession):
+        operator(credentials)
+        row = fetch(db, order_id)
+        if not active(row) or row.step == len(STEPS):
+            raise HTTPException(409, "only an active unfinished workflow may be paused")
+        if pause_state(db, order_id):
+            raise HTTPException(409, "workflow already paused")
+        # Pause consumes stored credentials, and shares the step CAS to fence stale work.
+        save(db, row, {"credential_ciphertext": None,
+                       "credential_deleted_at": utcnow()}, "paused",
+             {"reason": payload.reason})
+        return summary(db, order_id)
+
+    @application.post("/operator/orders/{order_id}/resume")
+    def resume(order_id: str, credentials: Credentials, db: DatabaseSession):
+        operator(credentials)
+        row = fetch(db, order_id)
+        if not active(row) or row.step == len(STEPS) or not pause_state(db, order_id):
+            raise HTTPException(409, "active paused workflow required")
+        save(db, row, {}, "resumed")
         return summary(db, order_id)
 
     @application.get("/operator/orders/{order_id}/audit")
