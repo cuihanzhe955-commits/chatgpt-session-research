@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "引用本项目时请使用以下仓库信息，并注明实际使用的 commit。"
+type: software
+title: "ChatGPT Session / Stripe 路线研究"
+authors:
+  - name: "cuihanzhe955-commits"
+repository-code: "https://github.com/cuihanzhe955-commits/chatgpt-session-research"
+url: "https://github.com/cuihanzhe955-commits/chatgpt-session-research"
+abstract: "面向网站集成的独立订单和 Stripe 测试支付模块，仅使用合成测试值。"
